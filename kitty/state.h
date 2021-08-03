@@ -52,6 +52,9 @@ typedef struct {
     bool background_image_linear;
     float background_tint;
 
+    char_type image_chars_first;
+    char_type image_chars_last;
+
     bool dynamic_background_opacity;
     float inactive_text_alpha;
     Edge tab_bar_edge;

@@ -338,6 +338,19 @@ Syntax is::
 '''))
 
 
+o(
+    'image_chars',
+    'U+F0000-U+F0FFF',
+    long_text=_('''
+Reserve the specified unicode codepoints for image placement. Currently the
+codepoints must be defined as a single range.
+Syntax is::
+
+    image_chars codepoints
+
+'''))
+
+
 def disable_ligatures(x: str) -> int:
     cmap = {'never': 0, 'cursor': 1, 'always': 2}
     return cmap.get(x.lower(), 0)

@@ -510,6 +510,10 @@ START_ALLOW_CASE_RANGE
         case 0x1fba0 ... 0x1fbae:
             return BOX_FONT;
         default:
+            // Don't display characters reserved for images.
+            if (cpu_cell->ch >= global_state.opts.image_chars_first &&
+                cpu_cell->ch <= global_state.opts.image_chars_last)
+                return BLANK_FONT;
             ans = in_symbol_maps(fg, cpu_cell->ch);
             if (ans > -1) return ans;
             switch(BI_VAL(gpu_cell->attrs)) {

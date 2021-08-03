@@ -148,6 +148,7 @@ img_by_client_number(GraphicsManager *self, uint32_t number) {
 
 static inline void
 remove_image(GraphicsManager *self, size_t idx) {
+    assert(idx < self->image_count);
     free_image(self, self->images + idx);
     remove_i_from_array(self->images, idx, self->image_count);
     self->layers_dirty = true;
@@ -382,6 +383,115 @@ get_free_client_id(const GraphicsManager *self) {
     return ans;
 }
 
+// Removes the oldest cell image and returns the freed client_id. If possible,
+// an image with zero reference count is preferred.
+static inline uint32_t
+remove_oldest_cell_image(GraphicsManager *self) {
+    uint32_t range_first = global_state.opts.image_chars_first;
+    uint32_t range_last = global_state.opts.image_chars_last;
+    uint32_t oldest_i = -1;
+    uint32_t oldest_id = 0;
+    bool oldest_is_referenced = false;
+    monotonic_t oldest_atime = MONOTONIC_T_MAX;
+    for (size_t i = 0; i < self->image_count; i++) {
+        Image *q = self->images + i;
+        if (q->client_id < range_first || q->client_id > range_last)
+            continue;
+        if (!oldest_is_referenced && q->refcnt > 0)
+            continue;
+        if (q->atime >= oldest_atime)
+            continue;
+        oldest_i = i;
+        oldest_id = q->client_id;
+        oldest_is_referenced = (q->refcnt > 0);
+        oldest_atime = q->atime;
+    }
+    if (oldest_id != 0) {
+        remove_image(self, oldest_i);
+    }
+    return oldest_id;
+}
+
+// Gets a free client id that is suitable for cell images. The are several
+// differences from get_free_client_id:
+// - The resulting id is taken from the supported unicode symbol range (the
+//   client id coincides with the 32-bit value of the unicode symbol used to
+//   place the image).
+// - The id is randomized to minimize the probability of clash between different
+//   apps and ssh sessions.
+// - If there is no suitable client id then the oldest cell image without
+//   references is removed.
+// If the range of suitable unicode symbols is empty or no image can be
+// deallocated, zero value is returned. Zero is never considered to be a correct
+// client_id.
+static inline uint32_t get_free_cell_image_client_id(GraphicsManager *self) {
+    if (global_state.opts.image_chars_first >
+        global_state.opts.image_chars_last)
+        return 0;
+    uint32_t range_first = global_state.opts.image_chars_first;
+    uint32_t range_last = global_state.opts.image_chars_last;
+    uint32_t range_size = range_last - range_first + 1;
+    uint32_t candidate_id = range_first + rand() % range_size;
+    if (!self->image_count) return candidate_id;
+    // Gather all client ids that fall into the reserved range.
+    uint32_t *client_ids = malloc(sizeof(uint32_t) * self->image_count);
+    size_t count = 0;
+    for (size_t i = 0; i < self->image_count; i++) {
+        Image *q = self->images + i;
+        if (q->client_id >= range_first && q->client_id <= range_last)
+            client_ids[count++] = q->client_id;
+    }
+    if (!count) {
+        free(client_ids);
+        return candidate_id;
+    }
+    if (count == range_size) {
+        free(client_ids);
+        // Delete the oldest unreferenced image and use its id.
+        return remove_oldest_cell_image(self);
+    }
+    assert(count > 0 && count < range_size);
+    // Sort ids by the distance to the candidate_id
+    // (which is defined as (x - candidate_id) % range_size for the euclidean
+    // definition of %)
+#define dist_to_candidate(x)                    \
+    (((x) >= candidate_id) ? ((x)-candidate_id) \
+                           : ((x)-candidate_id + range_size))
+#define int_lt(a, b) (dist_to_candidate(*a) < dist_to_candidate(*b))
+    QSORT(uint32_t, client_ids, count, int_lt)
+#undef int_lt
+    // Now find the first gap. `prev_candidate_dist` is the distance between
+    // `candidate_id` and the current potential gap.
+    uint32_t prev_candidate_dist = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint32_t cur_id = client_ids[i];
+        uint32_t cur_dist = dist_to_candidate(cur_id);
+        assert(cur_dist >= prev_candidate_dist);
+        if (cur_dist > prev_candidate_dist) break;
+        prev_candidate_dist = cur_dist + 1;
+    }
+    assert(prev_candidate_dist < range_size);
+    // Convert the distance to the element in the found gap to an id.
+    uint32_t result_id;
+    if (prev_candidate_dist <= range_last - candidate_id)
+        result_id = candidate_id + prev_candidate_dist;
+    else
+        result_id =
+            prev_candidate_dist - (range_last - candidate_id + 1) + range_first;
+    assert(dist_to_candidate(result_id) == prev_candidate_dist);
+    // Check that we've converted it correctly and the resulting id is indeed
+    // unused.
+    assert(result_id >= range_first && result_id <= range_last);
+#ifndef NDEBUG
+    for (size_t i = 0; i < count; i++) {
+        assert(result_id != client_ids[i]);
+    }
+#endif
+    free(client_ids);
+    return result_id;
+#undef dist_to_candidate
+}
+
 #define ABRT(code, ...) { set_command_failed_response(code, __VA_ARGS__); self->currently_loading.loading_completed_successfully = false; free_load_data(&self->currently_loading); return NULL; }
 
 #define MAX_DATA_SZ (4u * 100000000u)
@@ -488,6 +598,7 @@ initialize_load_data(GraphicsManager *self, const GraphicsCommand *g, Image *img
     self->currently_loading = (const LoadData){0};
     self->currently_loading.start_command = *g;
     self->currently_loading.width = g->data_width; self->currently_loading.height = g->data_height;
+    self->currently_loading.reference_rows = g->num_lines; self->currently_loading.reference_columns = g->num_cells;
     switch(data_fmt) {
         case PNG:
             if (g->data_sz > MAX_DATA_SZ) ABRT("EINVAL", "PNG data size too large");
@@ -549,6 +660,19 @@ handle_add_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_
         self->currently_loading.loading_for = (const ImageAndFrame){0};
         if (g->data_width > MAX_IMAGE_DIMENSION || g->data_height > MAX_IMAGE_DIMENSION) ABRT("EINVAL", "Image too large");
         remove_images(self, add_trim_predicate, 0);
+        if (!iid) {
+            if (g->num_lines) {
+                // We assume that if the number of rows is specified then we
+                // want to allocate a client id in the cell image range.
+                iid = get_free_cell_image_client_id(self);
+                if (!iid)
+                    ABRT("ENOSPC", "Too many cell images.");
+            } else if (g->image_number) {
+                iid = get_free_client_id(self);
+            } else {
+                ABRT("EINVAL", "Neither client_id nor client number was specified.");
+            }
+        }
         img = find_or_create_image(self, iid, &existing);
         if (existing) {
             img->root_frame_data_loaded = false;
@@ -561,10 +685,6 @@ handle_add_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_
             img->internal_id = internal_id_counter++;
             img->client_id = iid;
             img->client_number = g->image_number;
-            if (!img->client_id && img->client_number) {
-                img->client_id = get_free_client_id(self);
-                iid = img->client_id;
-            }
         }
         img->atime = monotonic(); img->used_storage = 0;
         if (!initialize_load_data(self, g, img, tt, fmt, 0)) return NULL;
@@ -587,6 +707,8 @@ handle_add_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_
     if (self->currently_loading.loading_completed_successfully) {
         img->width = self->currently_loading.width;
         img->height = self->currently_loading.height;
+        img->rows = self->currently_loading.reference_rows;
+        img->columns = self->currently_loading.reference_columns;
         if (img->root_frame.id) remove_from_cache(self, (const ImageAndFrame){.image_id=img->internal_id, .frame_id=img->root_frame.id});
         img->root_frame = (const Frame){
             .id = ++img->frame_id_counter,
@@ -663,13 +785,155 @@ update_dest_rect(ImageRef *ref, uint32_t num_cols, uint32_t num_rows, CellPixelS
     ref->effective_num_cols = num_cols;
 }
 
+// A helper to fit the image to width and center vertically (also used to fit it
+// to height and center horizontally).
+static bool
+fit_to_width_helper(uint32_t img_width, uint32_t img_height,
+                    uint32_t img_columns, uint32_t img_rows,
+                    uint32_t x, uint32_t y, uint32_t *w, uint32_t *h,
+                    uint32_t *src_x, uint32_t *src_y,
+                    uint32_t *src_width, uint32_t *src_height,
+                    uint32_t cell_width, uint32_t cell_height,
+                    uint32_t *cell_y_offset, int32_t *start_row) {
+    float src_offset = 0;
+    // Dimensions of a cell in the original image's units
+    float src_cell_width = (float)img_width / img_columns;
+    float src_cell_height = src_cell_width * cell_height / cell_width;
+    float src_x_float = (uint32_t)(x * src_cell_width);
+    // We center the image vertically, so the source y coordinate may become
+    // negative, in which case we have to adjust the starting row and the
+    // vertical offset
+    float src_y_float =
+        y * src_cell_height - (src_cell_height * img_rows - img_height) / 2;
+    if (src_y_float < 0) {
+        // If the source is negative we have to remove some integer number of
+        // rows and the rest will be compensated by cell_y_offset.
+        uint32_t empty_lines = (uint32_t)(-src_y_float / src_cell_height);
+        if (*h <= empty_lines) return false;
+        *h -= empty_lines;
+        *start_row += empty_lines;
+        src_y_float += empty_lines * src_cell_height;
+        // Now the offset.
+        *cell_y_offset =
+            (uint32_t)(-src_y_float * cell_height / src_cell_height);
+        src_offset = -src_y_float;
+        src_y_float = 0;
+    } else if ((uint32_t)src_y_float >= img_height) {
+        // Do not create this ref if it is completely out of bounds
+        return false;
+    }
+    float src_width_float = src_cell_width * *w;
+    if (src_x_float + src_width_float > img_width) {
+        // If the width is out of bounds, we remove some columns from the right.
+        // Note that we remove an integer number of rows, so the image may still
+        // underfit.
+        uint32_t empty_lines_at_end = (uint32_t)(
+            (src_x_float + src_width_float - img_width) / src_cell_width);
+        *w -= empty_lines_at_end;
+        src_width_float -= empty_lines_at_end * src_cell_width;
+    }
+    float src_height_float = src_cell_height * *h - src_offset;
+    if (src_y_float + src_height_float > img_height) {
+        // If the height is out of bounds, we remove some rows at the bottom.
+        // Note that we remove an integer number of rows, so the image may still
+        // underfit.
+        uint32_t empty_lines_at_end = (uint32_t)(
+            (src_y_float + src_height_float - img_height) / src_cell_height);
+        *h -= empty_lines_at_end;
+        src_height_float -= empty_lines_at_end * src_cell_height;
+    }
+    *src_x = (uint32_t)src_x_float;
+    *src_y = (uint32_t)src_y_float;
+    *src_width = (uint32_t)src_width_float;
+    *src_height = (uint32_t)src_height_float;
+    return true;
+}
+
+// Parameters:
+// - `self` - the graphics manager
+// - `row` - the starting row of the screen
+// - `col` - the starting column of the screen
+// - `id` - the id of the image
+// - `x` - the column of the image we want to start with
+// - `y` - the row of the image we want to start with
+// - `w` - the number of image columns we want to display
+// - `h` - the number of image rows we want to display
+// - `cell` - the size of a screen cell
+// Note: the image is resized to fit a box of cells with dimensions
+// `img->columns` by `img->rows`, and parameters `x`, `y, `w`, `h` describe a
+// part of this box that we want to display. Note also that the exact pixel
+// dimensions of this box depend on the cell dimensions, so we recompute how
+// exactly we need to stretch the image inside the box each time (because cell
+// dimensions might change). We might want to cache the result of this
+// computation in the future.
+Image *grman_put_cell_image(GraphicsManager *self, uint32_t row, uint32_t col,
+                            uint32_t id, uint32_t x, uint32_t y, uint32_t w,
+                            uint32_t h, CellPixelSize cell) {
+    Image *img = img_by_client_id(self, id);
+    if (img == NULL) return NULL;
+
+    // Create the ref structure on stack first. We will not create a real
+    // reference if the image is completely out of bounds.
+    ImageRef ref = {0};
+
+    uint32_t img_rows = img->rows;
+    uint32_t img_columns = img->columns;
+    // If the number of columns or rows for the image is not set, compute them
+    // in such a way that the image is as close as possible to its natural size.
+    if (img_columns == 0)
+        img_columns = (img->width + cell.width - 1) / cell.width;
+    if (img_rows == 0) img_rows = (img->height + cell.height - 1) / cell.height;
+
+    ref.start_row = row;
+    ref.start_column = col;
+
+    // Fit the image to the box while preserving aspect ratio
+    if (img->width * img_rows * cell.height >
+        img->height * img_columns * cell.width) {
+        // Fit to width and center vertically
+        if (!fit_to_width_helper(
+                img->width, img->height, img_columns, img_rows, x, y, &w, &h,
+                &ref.src_x, &ref.src_y, &ref.src_width, &ref.src_height,
+                cell.width, cell.height, &ref.cell_y_offset, &ref.start_row))
+            return NULL;
+    } else {
+        // Fit to height and center horizontally
+        // We use the same function but with width and height swapped
+        if (!fit_to_width_helper(
+                img->height, img->width, img_rows, img_columns, y, x, &h, &w,
+                &ref.src_y, &ref.src_x, &ref.src_height, &ref.src_width,
+                cell.height, cell.width, &ref.cell_x_offset, &ref.start_column))
+            return NULL;
+    }
+
+    // If the computed height is zero, don't create a real reference for
+    // this image.
+    if (h == 0) return NULL;
+
+    // The cursor will be drawn on top of the image.
+    ref.z_index = -1;
+    ref.num_cols = w;
+    ref.num_rows = h;
+    ref.is_cell_image_ref = true;
+
+    // Create a real ref.
+    ensure_space_for(img, refs, ImageRef, img->refcnt + 1, refcap, 16, true);
+    self->layers_dirty = true;
+    ImageRef *real_ref = img->refs + img->refcnt++;
+    *real_ref = ref;
+    img->atime = monotonic();
+
+    update_src_rect(real_ref, img);
+    update_dest_rect(real_ref, w, h, cell);
+    return img;
+}
 
 static uint32_t
 handle_put_command(GraphicsManager *self, const GraphicsCommand *g, Cursor *c, bool *is_dirty, Image *img, CellPixelSize cell) {
     if (img == NULL) {
         if (g->id) img = img_by_client_id(self, g->id);
         else if (g->image_number) img = img_by_client_number(self, g->image_number);
-        if (img == NULL) { set_command_failed_response("ENOENT", "Put command refers to non-existent image with id: %u and number: %u", g->id, g->image_number); return g->id; }
+        if (img == NULL) { set_command_failed_response("ENOENT", "Put command refers to non-existent image with id: %u and number: %u out of %u images", g->id, g->image_number, self->image_count); return g->id; }
     }
     if (!img->root_frame_data_loaded) { set_command_failed_response("ENOENT", "Put command refers to image with id: %u that could not load its data", g->id); return img->client_id; }
     ensure_space_for(img, refs, ImageRef, img->refcnt + 1, refcap, 16, true);
@@ -880,11 +1144,12 @@ compose(const ComposeData d, uint8_t *under_data, const uint8_t *over_data) {
     const bool can_copy_rows = !d.needs_blending && d.over_px_sz == d.under_px_sz;
     unsigned min_row_sz = d.over_offset_x < d.under_width ? d.under_width - d.over_offset_x : 0;
     min_row_sz = MIN(min_row_sz, d.over_width);
+#define END_ITER }
 #define ROW_ITER for (unsigned y = 0; y + d.over_offset_y < d.under_height && y < d.over_height; y++) { \
         uint8_t *under_row = under_data + (y + d.over_offset_y) * d.under_px_sz * d.under_width + d.under_px_sz * d.over_offset_x; \
         const uint8_t *over_row = over_data + y * d.over_px_sz * d.over_width;
     if (can_copy_rows) {
-        ROW_ITER memcpy(under_row, over_row, (size_t)d.over_px_sz * min_row_sz);}
+        ROW_ITER memcpy(under_row, over_row, (size_t)d.over_px_sz * min_row_sz); END_ITER
         return;
     }
 #define PIX_ITER for (unsigned x = 0; x < min_row_sz; x++) { \
@@ -893,24 +1158,25 @@ compose(const ComposeData d, uint8_t *under_data, const uint8_t *over_data) {
 #define COPY_RGB under_px[0] = over_px[0]; under_px[1] = over_px[1]; under_px[2] = over_px[2];
     if (d.needs_blending) {
         if (d.under_px_sz == 3) {
-            ROW_ITER PIX_ITER blend_on_opaque(under_px, over_px); }}
+            ROW_ITER PIX_ITER blend_on_opaque(under_px, over_px); END_ITER END_ITER
         } else {
-            ROW_ITER PIX_ITER alpha_blend(under_px, over_px); }}
+            ROW_ITER PIX_ITER alpha_blend(under_px, over_px); END_ITER END_ITER
         }
     } else {
         if (d.under_px_sz == 4) {
             if (d.over_px_sz == 4) {
-                ROW_ITER PIX_ITER COPY_RGB under_px[3] = over_px[3]; }}
+                ROW_ITER PIX_ITER COPY_RGB under_px[3] = over_px[3]; END_ITER END_ITER
             } else {
-                ROW_ITER PIX_ITER COPY_RGB under_px[3] = 255; }}
+                ROW_ITER PIX_ITER COPY_RGB under_px[3] = 255; END_ITER END_ITER
             }
         } else {
-            ROW_ITER PIX_ITER COPY_RGB }}
+            ROW_ITER PIX_ITER COPY_RGB END_ITER END_ITER
         }
     }
 #undef COPY_RGB
 #undef PIX_ITER
 #undef ROW_ITER
+#undef END_ITER
 }
 
 static CoalescedFrameData
@@ -1293,7 +1559,13 @@ filter_refs(GraphicsManager *self, const void* data, bool free_images, bool (*fi
                 matched = true;
             }
         }
-        if (img->refcnt == 0 && (free_images || img->client_id == 0)) remove_image(self, i);
+        // We do not delete images from the cell image interval because they are
+        // intended to be managed in a sloppier manner.
+        if (!(img->client_id >= global_state.opts.image_chars_first &&
+              img->client_id <= global_state.opts.image_chars_last)) {
+            if (img->refcnt == 0 && (free_images || img->client_id == 0))
+                remove_image(self, i);
+        }
         if (only_first_image && matched) break;
     }
 }
@@ -1306,7 +1578,13 @@ modify_refs(GraphicsManager *self, const void* data, bool free_images, bool (*fi
         for (size_t j = img->refcnt; j-- > 0;) {
             if (filter_func(img->refs + j, img, data, cell)) remove_i_from_array(img->refs, j, img->refcnt);
         }
-        if (img->refcnt == 0 && (free_images || img->client_id == 0)) remove_image(self, i);
+        // We do not delete images from the cell image interval because they are
+        // intended to be managed in a sloppier manner.
+        if (!(img->client_id >= global_state.opts.image_chars_first &&
+              img->client_id <= global_state.opts.image_chars_last)) {
+            if (img->refcnt == 0 && (free_images || img->client_id == 0))
+                remove_image(self, i);
+        }
     }
 }
 
@@ -1470,6 +1748,20 @@ handle_delete_command(GraphicsManager *self, const GraphicsCommand *g, Cursor *c
 
 // }}}
 
+static inline bool row_filter_func(const ImageRef *ref, Image UNUSED *img,
+                                    const void *data,
+                                    CellPixelSize cell UNUSED) {
+    int32_t row = *(int32_t *)data;
+    return ref->is_cell_image_ref && ref->start_row == row;
+}
+
+// Remove cell images from the given row.
+void
+grman_remove_cell_images(GraphicsManager *self, int32_t row) {
+    CellPixelSize dummy = {0};
+    filter_refs(self, &row, false, row_filter_func, dummy, false);
+}
+
 void
 grman_resize(GraphicsManager *self, index_type UNUSED old_lines, index_type UNUSED lines, index_type UNUSED old_columns, index_type UNUSED columns) {
     self->layers_dirty = true;
@@ -1560,6 +1852,46 @@ grman_handle_command(GraphicsManager *self, const GraphicsCommand *g, const uint
         case 'd':
             handle_delete_command(self, g, c, is_dirty, cell);
             break;
+        case 'U': {
+            // Find an image by unique ID or set the unique ID of an image.
+            if (g->payload_sz > 64) {
+                REPORT_ERROR("A UID can't be more than 64 bytes");
+                break;
+            }
+            uint8_t uid[64] = {0};
+            memcpy(uid, payload, g->payload_sz);
+            if (!g->id && !g->image_number) {
+                // Find an image with the given UID
+                static char response[64];
+                for (size_t i = 0; i < self->image_count; i++) {
+                    Image *img = self->images + i;
+                    if (img->client_id && memcmp(img->uid, uid, 64) == 0) {
+                        snprintf(response, 64, "Gi=%u;OK", img->client_id);
+                        return response;
+                    }
+                }
+                snprintf(response, 64, "G;NOTFOUND");
+                ret = response;
+            } else {
+                // Set image UID
+                Image *img = NULL;
+                if (g->id)
+                    img = img_by_client_id(self, g->id);
+                else if (g->image_number)
+                    img = img_by_client_number(self, g->image_number);
+                if (img) {
+                    memcpy(img->uid, uid, 64);
+                } else {
+                    set_command_failed_response(
+                        "ENOENT",
+                        "Set UID command refers to non-existent image with id: "
+                        "%u and number: %u out of %u images",
+                        g->id, g->image_number, self->image_count);
+                }
+                ret = finish_command_response(g, true);
+            }
+            break;
+        }
         default:
             REPORT_ERROR("Unknown graphics command action: %c", g->action);
             break;

@@ -259,6 +259,7 @@ read_exe_path(char *exe, size_t buf_sz) {
 #endif // }}}
 
 int main(int argc, char *argv[]) {
+    srand(time(0));
     char exe[PATH_MAX+1] = {0};
     char exe_dir_buf[PATH_MAX+1] = {0};
     FREE_AFTER_FUNCTION const char *lc_ctype = NULL;

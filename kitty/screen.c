@@ -1774,6 +1774,55 @@ screen_has_marker(Screen *self) {
     return self->marker != NULL;
 }
 
+// Scan the line and create cell images in place of unicode symbols reserved for
+// image placement.
+// TODO: Move this to render_line
+static void
+screen_render_line_graphics(Screen *self, Line *line, index_type lnum) {
+    index_type i;
+    grman_remove_cell_images(self->grman, lnum);
+    // 0 client id is considered to be incorrect (doesn't denote any image).
+    uint32_t prev_id = 0;
+    uint32_t prev_img_row = -1;
+    uint32_t strike = 0;
+    for (i = 0; i < line->xnum; i++) {
+        CPUCell *cpu_cell = line->cpu_cells + i;
+        GPUCell *gpu_cell = line->gpu_cells + i;
+        uint32_t id = 0;
+        uint32_t img_row = 0;
+        if (cpu_cell->ch >= global_state.opts.image_chars_first &&
+            cpu_cell->ch <= global_state.opts.image_chars_last) {
+            // The client_id coincides with the value of the character.
+            id = cpu_cell->ch;
+            // In 256 colors mode the foreground color indicates the row number.
+            // In 24-bit color mode we use the blue component for that.
+            // TODO: We can use other components for something, like the column
+            // number.
+            if ((gpu_cell->fg & 0xff) == 2) {
+                color_type fg_color = gpu_cell->fg;
+                /* uint32_t r = (fg_color >> 24) & 0xff; */
+                /* uint32_t g = (fg_color >> 16) & 0xff; */
+                uint32_t b = (fg_color >> 8) & 0xff;
+                img_row = b;
+            } else {
+                img_row = gpu_cell->fg >> 8;
+            }
+        }
+        if (id == prev_id && img_row == prev_img_row) {
+            strike++;
+        } else {
+            if (prev_id)
+                grman_put_cell_image(self->grman, lnum, i - strike, prev_id, 0,
+                                     prev_img_row, strike, 1, self->cell_size);
+            prev_id = id;
+            prev_img_row = img_row;
+            strike = 1;
+        }
+    }
+    if (prev_id)
+        grman_put_cell_image(self->grman, lnum, i - strike, prev_id, 0,
+                             prev_img_row, strike, 1, self->cell_size);
+}
 
 void
 screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_data, bool cursor_has_moved) {
@@ -1786,6 +1835,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
     for (index_type y = 0; y < MIN(self->lines, self->scrolled_by); y++) {
         lnum = self->scrolled_by - 1 - y;
         historybuf_init_line(self->historybuf, lnum, self->historybuf->line);
+        screen_render_line_graphics(self, self->historybuf->line, y - self->scrolled_by);
         if (self->historybuf->line->has_dirty_text) {
             render_line(fonts_data, self->historybuf->line, lnum, self->cursor, self->disable_ligatures);
             if (screen_has_marker(self)) mark_text_in_line(self->marker, self->historybuf->line);
@@ -1796,6 +1846,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
     for (index_type y = self->scrolled_by; y < self->lines; y++) {
         lnum = y - self->scrolled_by;
         linebuf_init_line(self->linebuf, lnum);
+        screen_render_line_graphics(self, self->linebuf->line, lnum);
         if (self->linebuf->line->has_dirty_text ||
             (cursor_has_moved && (self->cursor->y == lnum || self->last_rendered.cursor_y == lnum))) {
             render_line(fonts_data, self->linebuf->line, lnum, self->cursor, self->disable_ligatures);

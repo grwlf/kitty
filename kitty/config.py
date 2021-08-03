@@ -460,6 +460,26 @@ def parse_symbol_map(val: str) -> Dict[Tuple[int, int], str]:
         symbol_map[(a, b)] = family
     return symbol_map
 
+def parse_symbol_range(val: str) -> Optional[Tuple[int, int]]:
+    def abort() -> None:
+        log_error('Symbol map: {} is invalid, ignoring'.format(
+            val))
+        return None
+
+    def to_chr(x: str) -> int:
+        if not x.startswith('U+'):
+            raise ValueError()
+        return int(x[2:], 16)
+
+    a_, b_ = val.partition('-')[::2]
+    b_ = b_ or a_
+    try:
+        a, b = map(to_chr, (a_, b_))
+    except Exception:
+        return abort()
+    if b < a or max(a, b) > sys.maxunicode or min(a, b) < 1:
+        return abort()
+    return (a, b)
 
 def parse_send_text_bytes(text: str) -> bytes:
     return python_string(text).encode('utf-8')
@@ -505,6 +525,18 @@ def handle_map(key: str, val: str, ans: Dict[str, Any]) -> None:
 @special_handler
 def handle_symbol_map(key: str, val: str, ans: Dict[str, Any]) -> None:
     ans['symbol_map'].update(parse_symbol_map(val))
+
+
+@special_handler
+def handle_image_chars(key: str, val: str, ans: Dict[str, Any]) -> None:
+    bounds = parse_symbol_range(val)
+    if bounds:
+        ans['image_chars_first'] = max(bounds[0], 1)
+        ans['image_chars_last'] = bounds[1]
+    else:
+        log_error("Disabling cell images because the symbol range is invalid")
+        ans['image_chars_first'] = 0
+        ans['image_chars_last'] = 0
 
 
 @special_handler

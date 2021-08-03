@@ -1,3 +1,127 @@
+= Proof-of-concept implementation of cell image placement
+
+This fork of kitty implements an alternative approach to image placement that's
+supposed to work with tmux, vim and similar applications without them knowing
+anything about the kitty graphics protocol.
+
+Basically, we assign a unicode symbol to each image and use foreground color to
+distinguish between lines of a single image. That is, if a 5 rows by 10 columns
+image is assigned to the symbol `♥`, it can be displayed by outputting this:
+
+  ^[[38;5;0m♥♥♥♥♥♥♥♥♥♥
+  ^[[38;5;1m♥♥♥♥♥♥♥♥♥♥
+  ^[[38;5;2m♥♥♥♥♥♥♥♥♥♥
+  ^[[38;5;3m♥♥♥♥♥♥♥♥♥♥
+  ^[[38;5;4m♥♥♥♥♥♥♥♥♥♥
+
+By default the unicode symbols are assigned at random from the range
+`U+F0000-U+F0FFF` (it's a subset of the unicode private use area). This range
+can be changed in `kitty.conf` (only one contiguous range is allowed for now):
+
+  image_chars U+F0000-U+F0FFF
+
+You can use the script `./vim-terminal-images/upload-terminal-image.sh`
+(requires bash and ImageMagick) to upload and display images using this method:
+
+  ./vim-terminal-images/upload-terminal-image.sh logo/kitty.png -c 10 -r 5
+
+There is also a demo vim plugin which can be used to preview images under
+cursor (requires popup windows):
+
+  Plug '/path/to/kitty/vim-terminal-images'
+  " Show image on cursor hold:
+  autocmd CursorHold * :ShowImageUnderCursorIfReadable
+  " Or something less annoying:
+  nnoremap <leader>si :ShowImageUnderCursor<cr>
+
+== Creating cell images
+
+The code of the symbol used to display an image coincides with the client id of
+that image. So, to make an image displayable using this method, we need to
+assign it a client id that falls within the `image_chars` range. We will call
+such images cell images. Besides being displayable using the corresponding
+unicode symbols, they have a couple of other differences from normal images:
+
+- They are not deleted automatically when there are no more references to this
+  image. They are deleted only when the terminal is out of space for images or
+  out of valid cell image client ids.
+- They have the default number of rows and columns. Normally in kitty
+  the number of rows and columns is specified during image placement, but for
+  cell images this information is specified when the image is uploaded.
+
+The easiest way to assign a valid client id for a cell image is to ask the
+terminal to pick a free client id at random. To do this we just need to specify
+the number of rows and columns when uploading an image:
+
+  ^[_Ga=t,I=42,f=100,t=d,c=10,r=5,m=1^[\
+
+Note `c=10,r=5` which is the only difference from a normal kitty graphics
+command. Kitty will understand this as a signal to assign a client id from
+`image_range`. Then after finishing the upload by emitting something like this:
+
+  ^[_GI=42,m=0^[\
+
+the terminal will respond with the assigned client id:
+
+  ^[_Gi=985030,I=42;OK^[\
+
+That's it, the value of `i` is the code of the symbol that we can use to display
+the image.
+
+The image will be fit to the rectangle of the specified size with its aspect
+ratio preserved (i.e. it will be either fit to width or to height and centered
+along the other dimension).
+
+== Querying whether an image already exists
+
+Currently the script for cell image uploading supports only direct transmission.
+To reduce the number of transmissions, this branch introduces another
+experimental feature: assigning (presumably) unique identifiers to images, and
+querying whether there is already an image with a given unique identifier. These
+unique identifiers are user-specified and may be arbitrary, but it's recommended
+to use some kind of hash sum. To assign a unique identifier to an image, use the
+`U` action and specify the identifier in base64 encoding:
+
+  ^[_Ga=U,i=985030,q=1;2cd22b80317bfe3b16bb46293a9168e9x5x10===^[\
+
+To query if there is an image with a given unique identifier, use the same `U`
+action but without the client id (the `i=...` part):
+
+  ^[_Ga=U,q=1;2cd22b80317bfe3b16bb46293a9168e9x5x10===^[\
+
+The terminal will either respond with the client id:
+
+  ^[_Gi=985809;OK^[\
+
+Or with a not-found response:
+
+  ^[_G;NOTFOUND^[\
+
+== Limitations, deficiencies and TODO
+
+In general, this approach was designed for simplicity, not for flexibility.
+
+* No advanced image positioning like text over image.
+* Only row numbers are specified, column numbers are simply guessed by
+  assuming that each contiguous sequence of symbols starts with the column 0.
+  This makes horizontal scrolling and floating windows over images problematic.
+  This can be fixed by using 24-bit colors and encoding columns as another
+  component, however I have concerns about vim's ability to handle that many
+  highlighting groups.
+* Currently there are some weird artifacts if the boundary of an image doesn't
+  coincide with a cell boundary.
+* For low-resolution images there are visible artifacts near cell boundaries.
+* If a tmux session is detached from one terminal and attached to another one,
+  there could be some confusion, like wrong images displayed in place of other
+  images.  Choosing unicode symbols randomly is supposed to alleviate this
+  problem to some extent, but it would be nice to have a more reliable
+  protection.
+* Image uploading is still annoying because it requires active interaction with
+  the terminal, and it doesn't work if the tmux pane is not active.
+* Resizing the image is done by reuploading it with different dimensions.
+
+From here the original kitty readme starts:
+
 = kitty - the fast, feature-rich, cross-platform, GPU based terminal
 
 See https://sw.kovidgoyal.net/kitty/[the kitty website].

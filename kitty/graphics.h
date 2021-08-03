@@ -27,6 +27,7 @@ typedef struct {
     int32_t start_row, start_column;
     uint32_t client_id;
     ImageRect src_rect;
+    bool is_cell_image_ref;
 } ImageRef;
 
 typedef struct {
@@ -39,6 +40,11 @@ typedef enum { ANIMATION_STOPPED = 0, ANIMATION_LOADING = 1, ANIMATION_RUNNING =
 typedef struct {
     uint32_t texture_id, client_id, client_number, width, height;
     id_type internal_id;
+
+    // default number of columns and rows
+    uint32_t columns, rows;
+    // Unique ID used to search for already uploaded images.
+    uint8_t uid[64];
 
     bool root_frame_data_loaded;
     ImageRef *refs;
@@ -80,6 +86,9 @@ typedef struct {
     uint8_t *mapped_file;
     size_t mapped_file_sz;
 
+    // default number of rows and columns
+    uint32_t reference_rows, reference_columns;
+
     size_t data_sz;
     uint8_t *data;
     bool is_4byte_aligned;
@@ -117,10 +126,12 @@ typedef struct {
 GraphicsManager* grman_alloc(void);
 void grman_clear(GraphicsManager*, bool, CellPixelSize fg);
 const char* grman_handle_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_t *payload, Cursor *c, bool *is_dirty, CellPixelSize fg);
+Image* grman_put_cell_image(GraphicsManager *self, uint32_t row, uint32_t col, uint32_t id, uint32_t x, uint32_t y, uint32_t w, uint32_t h, CellPixelSize cell);
 bool grman_update_layers(GraphicsManager *self, unsigned int scrolled_by, float screen_left, float screen_top, float dx, float dy, unsigned int num_cols, unsigned int num_rows, CellPixelSize);
 void grman_scroll_images(GraphicsManager *self, const ScrollData*, CellPixelSize fg);
 void grman_resize(GraphicsManager*, index_type, index_type, index_type, index_type);
 void grman_rescale(GraphicsManager *self, CellPixelSize fg);
+void grman_remove_cell_images(GraphicsManager *self, int32_t row);
 void gpu_data_for_centered_image(ImageRenderData *ans, unsigned int screen_width_px, unsigned int screen_height_px, unsigned int width, unsigned int height);
 bool png_path_to_bitmap(const char *path, uint8_t** data, unsigned int* width, unsigned int* height, size_t* sz);
 bool scan_active_animations(GraphicsManager *self, const monotonic_t now, monotonic_t *minimum_gap, bool os_window_context_set);
