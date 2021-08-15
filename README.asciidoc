@@ -34,6 +34,14 @@ cursor (requires popup windows):
   " Or something less annoying:
   nnoremap <leader>si :ShowImageUnderCursor<cr>
 
+Image preview in vim:
+
+image::vim-image-preview.gif[]
+
+Scrolling images in a tmux pane:
+
+image::tmux-pane-scrolling.gif[]
+
 == Creating cell images
 
 The code of the symbol used to display an image coincides with the client id of
