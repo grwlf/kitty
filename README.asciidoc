@@ -128,6 +128,21 @@ In general, this approach was designed for simplicity, not for flexibility.
   the terminal, and it doesn't work if the tmux pane is not active.
 * Resizing the image is done by reuploading it with different dimensions.
 
+== Nix installation
+
+1. Install https://nixos.org/nix[Nix]. We re-use Nix build expression for Kitty,
+   so make sure its version doesn't differ too much from the version of this
+   source. Expressions for `kitty-0.21.*` should work fine.
+2. Clone this repository.
+3. Run the nix builder from the project's root folder.
+
+  nix-build
+
+4. Check the `./result/bin/kitty`. If everything works as expected, install
+   the result into system:
+
+  nix-env -i ./result
+
 From here the original kitty readme starts:
 
 = kitty - the fast, feature-rich, cross-platform, GPU based terminal
